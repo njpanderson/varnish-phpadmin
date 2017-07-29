@@ -41,10 +41,10 @@ unable to provide historical data.
 
 ### 1) Generating the settings file.
 
-For obvious reasons, the settings file does not come with this package. You must generate it
+For obvious reasons, the settings file does not come pre-populated. You must fill it in
 yourself. Thankfully, it's pretty straightforwards and a template is below:
 
-```
+```php
 <?php
 /* This is a sample configuration file for Varnish PHP Admin
  * Please place this file next to the index.php file wherever it is installed
@@ -131,7 +131,7 @@ sub vcl_recv {
 			# Not from an allowed IP? Then die with an error.
 			return (synth(405, "This IP is not allowed to send PURGE requests."));
 		}
-	
+
 		# If you got this stage (and didn't error out above), purge the cached result
 		return (purge);
 	}
@@ -148,7 +148,7 @@ sub vcl_recv {
 			# Not from an allowed IP? Then die with an error.
 			return (synth(405, "This IP is not allowed to send BAN requests."));
 		}
-	
+
 		if (req.http.Ban-Query-Full) {
 			# A "full" ban query (the result of checking "Full Ban Query")
 			ban(req.http.Ban-Query-Full);
