@@ -180,7 +180,7 @@ Once you have the `index.php` and `settings.php` in a publicly accessible locati
 
 When you first load the admin page, you'll be prompted to enter your password. This will only happen once per session. Once you're in, you should see a screen similar to the following:
 
-![https://raw.githubusercontent.com/njpanderson/varnish-phpadmin/master/screenshot.png](Main page screenshot)
+![Main page screenshot](https://raw.githubusercontent.com/njpanderson/varnish-phpadmin/master/screenshot.png)
 
 The interface is comprised of three main parts:
 
