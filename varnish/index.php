@@ -8,7 +8,8 @@ session_start();
 
 $params = getParams(array(
 	'show-stats' => 'auto',
-	'settings' => getSettings()
+	'settings' => getSettings(),
+	'reload' => ''
 ));
 
 date_default_timezone_set($params['settings']['timezone']);
@@ -405,6 +406,7 @@ class VarnishCMD {
 	private $data;
 	private $socket;
 	private $http;
+	private $banlist;
 
 	protected $params;
 
@@ -474,8 +476,12 @@ class VarnishCMD {
 		return $this->parseTopLines($this->params['settings']['varnish_data_path'] . '/top-ua.json', 'ReqHeader\sUser-Agent\:');
 	}
 
-	protected function getBanList() {
-		return $this->getVarnishSocket()->getBanList();
+	protected function getBanList($force = false) {
+		if (!isset($_SESSION['banlist']) || $force) {
+			$_SESSION['banlist'] = $this->getVarnishSocket()->getBanList();
+		}
+
+		return $_SESSION['banlist'];
 	}
 
 	protected function addPurge($host, $uri) {
@@ -505,12 +511,14 @@ class VarnishCMD {
 
 		if ($this->params['settings']['varnish_ban_method'] === 'admin') {
 			// send ban request over admin port
+			$query = str_replace("\\", "\\\\", $query);
+
 			if ($full) {
 				$response = $this->getVarnishSocket()->addBan($query);
 			} else {
 				if (!empty($host)) {
 					$response = $this->getVarnishSocket()->addBan(
-						'req.http.host == \'' . $host . '\' && req.url ~ \'' . $query . '\''
+						'req.http.host == "' . $host . '" && req.url ~ "' . $query . '"'
 					);
 				} else {
 					$response = $this->getVarnishSocket()->addBan(
@@ -831,6 +839,14 @@ class VarnishAdmin extends VarnishCMD {
 		if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 			$this->handlePost();
 		}
+
+		if ($this->params['reload']) {
+			// reload cached data sets
+			$this->getBanList(true);
+
+			// redirect to version without reload
+			$this->redirect('', true);
+		}
 	}
 
 	public function hasSession() {
@@ -866,6 +882,36 @@ class VarnishAdmin extends VarnishCMD {
 		return $markup;
 	}
 
+	public function getBanList($force = false) {
+		return parent::getBanList($force);
+	}
+
+	public function getBanListTable($force = false) {
+		$list = $this->getBanList($force);
+		$table = '';
+
+		if (is_array($list) && count($list) > 0) {
+			$table = '<table class="table table-condensed">';
+			$table .= table::thead(array(
+				'Date',
+				'Ref',
+				'Spec'
+			));
+
+			foreach ($list as $ban) {
+				$table .= table::row(array(
+					date($this->params['settings']['date_format'], $ban['timestamp']),
+					$ban['ref'],
+					$ban['spec']
+				));
+			}
+
+			$table .= '</table>';
+		}
+
+		return $table;
+	}
+
 	private function handlePost() {
 		if (isset($_POST['ban'])) {
 			$this->checkSession();
@@ -880,7 +926,7 @@ class VarnishAdmin extends VarnishCMD {
 				// add banlist to response
 				$response['body'] =
 					'<h3>Ban list</h3>' .
-					$this->getBanListTable();
+					$this->getBanListTable(true);
 			}
 
 			$this->setVarnishResponse(
@@ -912,7 +958,7 @@ class VarnishAdmin extends VarnishCMD {
 			}
 		}
 
-		$this->redirect();
+		// $this->redirect();
 	}
 
 	private function setVarnishResponse($value, $data) {
@@ -932,35 +978,13 @@ class VarnishAdmin extends VarnishCMD {
 		$_SESSION[$key] = $value;
 	}
 
-	private function getBanListTable() {
-		$list = $this->getBanList();
-		$table = '';
-
-		if (is_array($list) && count($list) > 0) {
-			$table = '<table class="table table-condensed">';
-			$table .= table::thead(array(
-				'Date',
-				'Ref',
-				'Spec'
-			));
-
-			foreach ($list as $ban) {
-				$table .= table::row(array(
-					date($this->params['settings']['date_format'], $ban['timestamp']),
-					$ban['ref'],
-					$ban['spec']
-				));
-			}
-
-			$table .= '</table>';
-		}
-
-		return $table;
-	}
-
-	private function redirect($url = '') {
+	private function redirect($url = '', $trim_query = false) {
 		if (empty($url)) {
 			$url = $_SERVER['REQUEST_URI'];
+		}
+
+		if ($trim_query) {
+			$url = preg_replace('/\?.*/', '', $url);
 		}
 
 		header('Location: ' . $url);
@@ -1059,7 +1083,7 @@ if (!$admin->hasSession()) {
 			</div>
 
 			<div class="row">
-				<div class="col col-xs-10">
+				<div class="col col-xs-12">
 					<form action="" id="purgeban" method="post" class="form-inline">
 						<div class="form-group">
 							<label for="purgeban-host">Host</label>
@@ -1083,13 +1107,11 @@ if (!$admin->hasSession()) {
 							<label for="purgeban-full-ban-query" class="inline">Full ban query</label>
 						</div>
 
-						<button type="submit" name="purge" class="btn btn-primary"><span class="glyphicon glyphicon-refresh"></span>&nbsp;Purge</button>
-						<button type="submit" name="ban" class="btn btn-default"><span class="glyphicon glyphicon-ban-circle"></span>&nbsp;Ban</button>
+						<div class="pull-right">
+							<button type="submit" name="purge" class="btn btn-primary"><span class="glyphicon glyphicon-erase"></span>&nbsp;Purge</button>
+							<button type="submit" name="ban" class="btn btn-default"><span class="glyphicon glyphicon-asterisk"></span>&nbsp;Ban</button>
+						</div>
 					</form>
-				</div>
-
-				<div class="col col-xs-2">
-					<p><a class="btn btn-info pull-right" href="<?php echo $stats->uri; ?>">Reload</a></p>
 				</div>
 			</div>
 
@@ -1142,6 +1164,14 @@ if (!$admin->hasSession()) {
 				</div>
 
 				<div class="col col-xs-12 col-md-6">
+					<?php if ($params['settings']['varnish_ban_method'] === 'admin' && $admin->getBanList() > 0): ?>
+						<h2>
+							<span class="glyphicon glyphicon-asterisk"></span>&nbsp;Ban list
+							<a href="?reload=1" class="btn btn-default pull-right"><span class="glyphicon glyphicon-refresh"></span>&nbsp;Reload</a>
+						</h2>
+						<?php echo $admin->getBanListTable(); ?>
+					<?php endif; ?>
+
 					<h2><span class="glyphicon glyphicon-sort-by-attributes-alt"></span>&nbsp;Top</h2>
 
 					<h3>All</h3>
