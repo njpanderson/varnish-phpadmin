@@ -819,6 +819,10 @@ class VarnishAdmin extends VarnishCMD {
 	function __construct($params) {
 		parent::__construct($params);
 
+		if (empty($this->params['settings']['password'])) {
+			throw new Exception('Password not defined. Please define a password before continuing!');
+		}
+
 		if (isset($_SESSION['varnish_response']) && !empty($_SESSION['varnish_response'])) {
 			$this->varnish_response = $_SESSION['varnish_response'];
 			unset($_SESSION['varnish_response']);
@@ -826,10 +830,6 @@ class VarnishAdmin extends VarnishCMD {
 
 		if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 			$this->handlePost();
-		}
-
-		if (empty($this->params['settings']['password'])) {
-			throw new Exception('Password not defined. Please define a password before continuing!');
 		}
 	}
 
