@@ -585,7 +585,7 @@ class VarnishCMD {
 		return $this->http;
 	}
 
-	private function parseTopLines($file, $ident = '\w*') {
+	private function parseTopLines($file, $ident = '\w*', $limit = 20) {
 		$data = '';
 		$top = array();
 
@@ -595,7 +595,7 @@ class VarnishCMD {
 			if (!empty($data)) {
 				$data = explode("\n", $data);
 
-				foreach ($data as $line) {
+				for ($a = 0; ($line = $data[$a]) && $a < $limit; $a += 1) {
 					preg_match('/^([\d.]+)\s(' . $ident . ')\s(.*)$/', trim($line), $matches);
 
 					if ($matches !== null && count($matches) === 4) {
