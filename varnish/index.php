@@ -17,18 +17,43 @@ date_default_timezone_set($params['settings']['timezone']);
 header('Cache-control: private, no-cache');
 header('Expires: ' . gmdate('D, d M Y H:i:s \G\M\T'));
 
+/**
+ * Retrieve settings from the settings.php file
+ */
 function getSettings() {
 	if (file_exists('settings.php') && is_readable('settings.php')) {
-		return include 'settings.php';
+		$settings = include 'settings.php';
+
+		$settings = array_merge(array(
+			'password' => '',
+			'varnish_data_path' => '',
+			'apache_hosts_path' => '',
+			'varnish_http_ip' => '::1',
+			'varnish_http_port' => '80',
+			'timezone' => 'Europe/London',
+			'varnish_socket_ip' => '::1',
+			'varnish_socket_port' => '6082',
+			'varnish_socket_secret' => '',
+			'varnish_ban_method' => 'http',
+			'date_format' => 'j F Y g:i a'
+		), $settings);
+
+		return $settings;
 	} else {
 		throw new Exception('The "settings.php" file does not exist. Have you created it?');
 	}
 }
 
+/**
+ * Shortcut method for htmlentities
+ */
 function entities($str) {
 	return htmlentities($str, ENT_QUOTES, 'UTF-8');
 }
 
+/**
+ * Retrieves the parameters from $_GET
+ */
 function getParams($defaults) {
 	$params = array();
 
@@ -43,6 +68,9 @@ function getParams($defaults) {
 	return $params;
 }
 
+/**
+ * Static class to provide Apache host information
+ */
 class hosts {
 	static function getHostNames($hosts_path) {
 		$files = self::getHostFiles($hosts_path);
@@ -72,18 +100,207 @@ class hosts {
 	}
 }
 
-class socket {
+/**
+ * Sends and receives data to varnish over the administration port
+ */
+class VarnishSocket {
+	private $fp;
+	private $params;
+	private $auth;
+
+	const NL = "\n";
+
+	const CLIS_SYNTAX = 100;
+	const CLIS_UNKNOWN = 101;
+	const CLIS_UNIMPL = 102;
+	const CLIS_TOOFEW = 104;
+	const CLIS_TOOMANY = 105;
+	const CLIS_PARAM = 106;
+	const CLIS_AUTH = 107;
+	const CLIS_OK = 200;
+	const CLIS_TRUNCATED = 201;
+	const CLIS_CANT = 300;
+	const CLIS_COMMS = 400;
+	const CLIS_CLOSE = 500;
+
+	function __construct($params) {
+		$this->params = $params;
+	}
+
+	public function connect() {
+		$this->fp = @fsockopen(
+			$this->params['settings']['varnish_socket_ip'],
+			$this->params['settings']['varnish_socket_port'],
+			$errno,
+			$errstr,
+			5
+		);
+
+		// stream_set_timeout($this->fp, 2);
+
+		if (!$this->fp) {
+			throw new Exception($errstr . '(' . $errno . ')');
+		}
+
+		// get initial authentication response and authenticate
+		$response = $this->receive();
+		$this->sendAuth($response['message'][0]);
+	}
+
+	public function disconnect() {
+		fclose($this->fp);
+	}
+
+	public function getBanList() {
+		$this->checkAuth();
+		$response = $this->write('ban.list', self::CLIS_OK);
+		$banlist = array();
+
+		for ($a = 1; $a < count($response['message']); $a += 1) {
+			preg_match('/([\d\.]+)\s+(\d+)\s([CRO-]+) +(0x[^ ]+)?(.+)?/', $response['message'][$a], $match);
+
+			if (count($match) === 6) {
+				$flags = str_split(trim(str_replace('-', '', $match[3])));
+
+				$banlist[] = array(
+					'timestamp' => (double) $match[1],
+					'gmdate' => gmdate('c', $match[1]),
+					'ref' => (int) $match[2],
+					'flags' => (count($flags) > 0 && !empty($flags[0]) ? $flags : null),
+					'pointer' => (!empty($match[4]) ? $match[4] : null),
+					'spec' => trim($match[5])
+				);
+			}
+		}
+
+		return $banlist;
+	}
+
+	public function addBan($spec) {
+		$response = $this->write('ban ' . $spec);
+
+		switch ($response['code']) {
+		case self::CLIS_OK:
+			return true;
+
+		default:
+			return $response;
+		}
+	}
+
+	private function sendAuth($challenge) {
+		$response = $this->write('auth ' . $this->genAuthCode($challenge));
+
+		if ($response['code'] === self::CLIS_OK) {
+			$this->auth = true;
+		} else {
+			throw new Exception('Authentication failed.');
+		}
+	}
+
+	private function write($data, $expectedResponseCode = null) {
+		if ($this->fp) {
+			fwrite($this->fp, $data . self::NL);
+			return $this->receive($expectedResponseCode);
+		}
+	}
+
+	private function receive($expectedResponseCode = null) {
+		$response = '';
+		$chars_sent = 0;
+		$chars_expected = 0;
+
+		while (($line = fgets($this->fp)) !== false) {
+			// line starts with numeric code defining the response type and length of response
+			if (preg_match('/(\d{3})\s(\d+)/', $line, $code)) {
+				// set expected characters (including +1 for terminating newline)
+				$chars_expected = (int) $code[2] + 1;
+			} else {
+				$chars_sent += strlen($line);
+			}
+
+			$response .= $line;
+
+			if ($chars_sent >= $chars_expected) {
+				break;
+			}
+		}
+
+		$response = $this->parseResponse($response);
+
+		if (empty($expectedResponseCode) || $response['code'] === $expectedResponseCode) {
+			return $response;
+		} else {
+			throw new Exception('Invalid response from server');
+		}
+	}
+
+	private function parseResponse($data) {
+		$data = explode(self::NL, $data);
+		$message = array();
+
+		if (count($data) >= 2) {
+			$responseCode = trim($data[0]);
+			$responseCode = explode(' ', $responseCode);
+			$responseCode = (int) $responseCode[0];
+
+			if (is_numeric($responseCode)) {
+				for ($a = 1; $a < count($data); $a += 1) {
+					$data[$a] = trim($data[$a]);
+
+					if (!empty($data[$a])) {
+						$message[] = $data[$a];
+					}
+				}
+			} else {
+				return null;
+			}
+		}
+
+		return array(
+			'code' => $responseCode,
+			'message' => $message
+		);
+	}
+
+	private function genAuthCode($challenge) {
+		$string =
+			$challenge . self::NL .
+			$this->params['settings']['varnish_socket_secret'] . self::NL .
+			$challenge . self::NL;
+
+		return hash(
+			'sha256',
+			$string
+		);
+	}
+
+	private function checkAuth() {
+		if (!$this->fp || !$this->auth) {
+			throw new Exception('Connection has not yet taken place. Have you connected with connect()?');
+		}
+	}
+}
+
+/**
+ * Sends and receives requests to Varnish over HTTP
+ */
+class VarnishHTTP {
+	function __construct($params) {
+		$this->params = $params;
+	}
+
 	public function send(
 		$host,
 		$uri,
-		$method = 'PURGE',
+		$method = 'GET',
 		array $headers = array()
 	) {
 		$response = '';
 
 		$fp = @fsockopen(
-			$this->params['settings']['varnish_socket_ip'],
-			$this->params['settings']['varnish_socket_port'],
+			$this->params['settings']['varnish_http_ip'],
+			$this->params['settings']['varnish_http_port'],
 			$errno,
 			$errstr,
 			5
@@ -127,7 +344,7 @@ class socket {
 			return array(
 				'code' => $response_code,
 				'headers' => $response[0],
-				'body' => (isset($response[1]) ? $response[1] : null)
+				'_body' => (isset($response[1]) ? $response[1] : null)
 			);
 		} else {
 			throw new Exception('Socket could not be opened to host. ' . $errstr);
@@ -135,6 +352,9 @@ class socket {
 	}
 }
 
+/**
+ * Static utility class for creating generic data tables
+ */
 class table {
 	static function thead($cols) {
 		$output = '
@@ -176,9 +396,15 @@ class table {
 	}
 }
 
+/**
+ * Handles communincation with Varnish. Will use VarnishSocket or VarnishHTTP
+ * classes for certain tasks.
+ */
 class VarnishCMD {
 	private $files;
 	private $data;
+	private $socket;
+	private $http;
 
 	protected $params;
 
@@ -189,10 +415,10 @@ class VarnishCMD {
 	/**
 	 * Produces statistics from the most recent snapshot file
 	 */
-	public function getStats($withHistory = false) {
+	protected function getStats($withHistory = false) {
 		$this->files = $this->getStatFileList();
 
-		if (is_readable($this->files[0][1])) {
+		if (isset($this->files[0]) && is_readable($this->files[0][1])) {
 			$this->data = json_decode(file_get_contents($this->files[0][1]));
 
 			if ($withHistory) {
@@ -208,7 +434,7 @@ class VarnishCMD {
 	/**
 	 * Produces historical data given a snapshot
 	 */
-	public function getHistory($data) {
+	protected function getHistory($data) {
 		if (!$this->files) {
 			$this->files = $this->getStatFileList();
 		}
@@ -236,19 +462,130 @@ class VarnishCMD {
 		return $data;
 	}
 
-	public function getTop() {
+	protected function getTop() {
 		return $this->parseTopLines($this->params['settings']['varnish_data_path'] . '/top.json');
 	}
 
-	public function getTopMisses() {
+	protected function getTopMisses() {
 		return $this->parseTopLines($this->params['settings']['varnish_data_path'] . '/top-misses.json');
 	}
 
-	public function getTopUA() {
+	protected function getTopUA() {
 		return $this->parseTopLines($this->params['settings']['varnish_data_path'] . '/top-ua.json', 'ReqHeader\sUser-Agent\:');
 	}
 
-	public function parseTopLines($file, $ident = '\w*') {
+	protected function getBanList() {
+		return $this->getVarnishSocket()->getBanList();
+	}
+
+	protected function addPurge($host, $uri) {
+		$this->getVarnishHTTP();
+		return $this->http->send($host, $uri, 'PURGE');
+	}
+
+	protected function addBan($query, $full = false, $host = null) {
+		if ($this->params['settings']['varnish_ban_method'] === 'http') {
+			// send ban request over http
+			if ($full) {
+				$headers = array(
+					'Ban-Query-Full: ' . $query
+				);
+			} else {
+				$headers = array(
+					'Ban-Query: ' . $query
+				);
+			}
+
+			if (!empty($host)) {
+				return $this->getVarnishHTTP()->send($host, '/', 'BAN', $headers);
+			} else {
+				return 'Invalid hostname';
+			}
+		}
+
+		if ($this->params['settings']['varnish_ban_method'] === 'admin') {
+			// send ban request over admin port
+			if ($full) {
+				$response = $this->getVarnishSocket()->addBan($query);
+			} else {
+				if (!empty($host)) {
+					$response = $this->getVarnishSocket()->addBan(
+						'req.http.host == \'' . $host . '\' && req.url ~ \'' . $query . '\''
+					);
+				} else {
+					$response = $this->getVarnishSocket()->addBan(
+						'req.url ~ \'' . $query . '\''
+					);
+				}
+			}
+
+			if ($response === true) {
+				return array(
+					'code' => 200,
+					'headers' => array('200 Ban added.')
+				);
+			}
+
+			return array(
+				'code' => $response['code'],
+				'headers' => $response['message']
+			);
+		}
+
+		throw new Exception(
+			'Invalid ban method "' .
+			$this->params['varnish_ban_method'] .
+			'". Please choose "http" or "admin".'
+		);
+	}
+
+	private function getStatFileList() {
+		$output = array();
+		$statpath = $this->params['settings']['varnish_data_path'] . '/stat';
+
+		if (!file_exists($statpath) || !is_readable($statpath)) {
+			return $output;
+		}
+
+		$iterator = new RecursiveIteratorIterator(
+			new RecursiveDirectoryIterator(
+				$statpath,
+				FilesystemIterator::SKIP_DOTS | FilesystemIterator::UNIX_PATHS
+			)
+		);
+
+		foreach ($iterator as $file) {
+			if ($file->isFile() && is_numeric($file->getBasename('.json'))) {
+				$output[] = array($file->getMTime(), $file->getRealPath());
+			}
+		}
+
+		usort($output, function($a, $b) {
+			// return newest files first
+			return $a[0] < $b[0];
+		});
+
+		return $output;
+	}
+
+	private function getVarnishSocket() {
+		if (!$this->socket) {
+			$this->socket = new VarnishSocket($this->params);
+			$this->socket->connect();
+		}
+
+		return $this->socket;
+	}
+
+	private function getVarnishHTTP() {
+		if (!$this->http) {
+			$this->http = new VarnishHTTP($this->params);
+		}
+
+		return $this->http;
+	}
+
+	private function parseTopLines($file, $ident = '\w*') {
 		$data = '';
 		$top = array();
 
@@ -272,35 +609,6 @@ class VarnishCMD {
 		}
 
 		return $top;
-	}
-
-	private function getStatFileList() {
-		$output = array();
-		$statpath = $this->params['settings']['varnish_data_path'] . '/stat';
-
-		if (!file_exists($statpath) || !is_readable($statpath)) {
-			throw new Exception('Varnish stat path "' . $statpath . '" could not be found or could not be read.');
-		}
-
-		$iterator = new RecursiveIteratorIterator(
-			new RecursiveDirectoryIterator(
-				$statpath,
-				FilesystemIterator::SKIP_DOTS | FilesystemIterator::UNIX_PATHS
-			)
-		);
-
-		foreach ($iterator as $file) {
-			if ($file->isFile() && is_numeric($file->getBasename('.json'))) {
-				$output[] = array($file->getMTime(), $file->getRealPath());
-			}
-		}
-
-		usort($output, function($a, $b) {
-			// return newest files first
-			return $a[0] < $b[0];
-		});
-
-		return $output;
 	}
 }
 
@@ -504,17 +812,20 @@ class VarnishTop extends VarnishCMD {
 	}
 }
 
-class VarnishAdmin {
-	public $socket_response;
+class VarnishAdmin extends VarnishCMD {
+	public $varnish_response;
 	public $flashError;
 
-	private $params;
-
 	function __construct($params) {
-		$this->params = $params;
+		parent::__construct($params);
+
+		if (isset($_SESSION['varnish_response']) && !empty($_SESSION['varnish_response'])) {
+			$this->varnish_response = $_SESSION['varnish_response'];
+			unset($_SESSION['varnish_response']);
+		}
 
 		if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-			$this->socket_response = $this->handlePost();
+			$this->handlePost();
 		}
 
 		if (empty($this->params['settings']['password'])) {
@@ -526,10 +837,10 @@ class VarnishAdmin {
 		return !empty($_SESSION['varnish_user']);
 	}
 
-	public function format_socket_response() {
+	public function format_varnish_response() {
 		$class = '';
 
-		switch ($this->socket_response['code']) {
+		switch ($this->varnish_response['code']) {
 			case 200:
 				$class = ' class="label-success"';
 				break;
@@ -545,61 +856,119 @@ class VarnishAdmin {
 		}
 
 		$markup = '<pre' . $class . '><code class="response">' .
-			$this->socket_response['headers'][0] .
+			$this->varnish_response['headers'][0] .
 			'</code></pre>';
+
+		if (isset($this->varnish_response['body'])) {
+			$markup .= $this->varnish_response['body'];
+		}
 
 		return $markup;
 	}
 
 	private function handlePost() {
-		$socket_response = 'Invalid action type.';
-
 		if (isset($_POST['ban'])) {
+			$this->checkSession();
+
 			$host = $_POST['host'];
 			$query = $_POST['query'];
 
-			if (isset($_POST['full_ban_query'])) {
-				$headers = array(
-					'Ban-Query-Full: ' . $query
-				);
-			} else {
-				$headers = array(
-					'Ban-Query: ' . $query
-				);
+			$response = $this->addBan($query, isset($_POST['full_ban_query']), $host);
+
+			if ($response['code'] === 200 &&
+				$this->params['settings']['varnish_ban_method'] === 'admin') {
+				// add banlist to response
+				$response['body'] =
+					'<h3>Ban list</h3>' .
+					$this->getBanListTable();
 			}
 
-			$socket_response = socket::send($host, '/', 'BAN', $headers);
+			$this->setVarnishResponse(
+				$response,
+				array(
+					'host' => $host,
+					'query' => $query
+				)
+			);
 		} elseif (isset($_POST['purge'])) {
+			$this->checkSession();
+
 			$host = $_POST['host'];
 			$query = $_POST['query'];
 
-			$socket_response = socket::send($host, $query);
+			$this->setVarnishResponse(
+				$this->addPurge($host, $query),
+				array(
+					'host' => $host,
+					'query' => $query
+				)
+			);
 		} elseif (isset($_POST['login'])) {
 			if (!empty($_POST['password']) &&
 				$_POST['password'] === $this->params['settings']['password']) {
-				$this->setSession();
-				$this->redirect($_SERVER['REQUEST_URI']);
+				$this->setSession('varnish_user', 1);
 			} else {
 				$this->flashError = 'Invalid password';
 			}
 		}
 
-		return $socket_response;
+		$this->redirect();
 	}
 
-	private function setSession() {
-		$_SESSION['varnish_user'] = 1;
+	private function setVarnishResponse($value, $data) {
+		$this->setSession('varnish_response', array_merge($value, array(
+			'data' => $data
+		)));
 	}
 
-	private function redirect($url) {
+	private function checkSession() {
+		if (!$this->hasSession()) {
+			header('HTTP/1.1 403 Not Authorized');
+			exit;
+		}
+	}
+
+	private function setSession($key, $value) {
+		$_SESSION[$key] = $value;
+	}
+
+	private function getBanListTable() {
+		$list = $this->getBanList();
+		$table = '';
+
+		if (is_array($list) && count($list) > 0) {
+			$table = '<table class="table table-condensed">';
+			$table .= table::thead(array(
+				'Date',
+				'Ref',
+				'Spec'
+			));
+
+			foreach ($list as $ban) {
+				$table .= table::row(array(
+					date($this->params['settings']['date_format'], $ban['timestamp']),
+					$ban['ref'],
+					$ban['spec']
+				));
+			}
+
+			$table .= '</table>';
+		}
+
+		return $table;
+	}
+
+	private function redirect($url = '') {
+		if (empty($url)) {
+			$url = $_SERVER['REQUEST_URI'];
+		}
+
 		header('Location: ' . $url);
 		exit;
 	}
 }
 
 $admin = new VarnishAdmin($params);
-$stats = new VarnishStats($params);
-$top = new VarnishTop($params);
 ?>
 <!DOCTYPE html>
 <html>
@@ -650,7 +1019,9 @@ th span.desc {
 		</style>
 	</head>
 	<body>
-		<?php if (!$admin->hasSession()): ?>
+<?php
+if (!$admin->hasSession()) {
+?>
 		<div class="container-fluid head">
 			<div class="row">
 				<header class="col col-xs-12">
@@ -675,7 +1046,11 @@ th span.desc {
 				</div>
 			</div>
 		</div>
-		<?php else: ?>
+<?php
+} else {
+	$stats = new VarnishStats($params);
+	$top = new VarnishTop($params);
+?>
 		<div class="container-fluid head">
 			<div class="row">
 				<header class="col col-xs-12">
@@ -718,20 +1093,22 @@ th span.desc {
 				</div>
 			</div>
 
-			<?php if (!empty($admin->socket_response)): ?>
+			<?php if (!empty($admin->varnish_response)): ?>
 				<div class="row output">
 					<div class="col col-xs-12">
 						<div class="well">
+							<?php if (!empty($admin->varnish_response['data'])): ?>
 							<div class="list-group">
-								<p class="list-group-item">
-									<b>Host:</b> <span><?php echo entities($_POST['host']); ?></span>
-								</p>
-								<p class="list-group-item">
-									<b>Query:</b> <span><?php echo entities($_POST['query']); ?></span>
-								</p>
+								<?php foreach ($admin->varnish_response['data'] as $key => $value): ?>
+									<p class="list-group-item">
+										<b><?php echo entities($key) ?></b><span>
+										<?php echo entities($value); ?></span>
+									</p>
+								<?php endforeach; ?>
 							</div>
+							<?php endif; ?>
 
-							<?php echo $admin->format_socket_response(); ?>
+							<?php echo $admin->format_varnish_response(); ?>
 						</div>
 					</div>
 				</div>
@@ -781,7 +1158,9 @@ th span.desc {
 				</div>
 			</div>
 		</div>
-		<?php endif; ?>
+<?php
+}
+?>
 
 		<script src="//cdnjs.cloudflare.com/ajax/libs/jquery/3.2.1/jquery.min.js"></script>
 		<script src="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/js/bootstrap.min.js" integrity="sha384-Tc5IQib027qvyjSMfHjOMaLkfuWVxZxUPnCJA7l2mCWNIpG9mGCD8wGNIcPD7Txa" crossorigin="anonymous"></script>

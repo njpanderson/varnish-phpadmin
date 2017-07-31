@@ -10,11 +10,15 @@ $socket->connect();
 // var_dump($socket->getBanList());
 // var_dump($socket->addBan(''));
 // var_dump($socket->addBan('req.url ~ \'testing.*\''));
+// var_dump($socket->addBan('req.whatevz ~ \'hello\''));
 // var_dump($socket->getBanList());
 
 class VarnishSocket {
+	private $fp;
 	private $params;
 	private $auth;
+
+	const NL = "\n";
 
 	const CLIS_SYNTAX = 100;
 	const CLIS_UNKNOWN = 101;
@@ -59,18 +63,20 @@ class VarnishSocket {
 
 	public function getBanList() {
 		$this->checkAuth();
-		$response = $this->write('ban.list', 200);
+		$response = $this->write('ban.list', self::CLIS_OK);
 		$banlist = array();
 
 		for ($a = 1; $a < count($response['message']); $a += 1) {
 			preg_match('/([\d\.]+)\s+(\d+)\s([CRO-]+) +(0x[^ ]+)?(.+)?/', $response['message'][$a], $match);
 
 			if (count($match) === 6) {
+				$flags = str_split(trim(str_replace('-', '', $match[3])));
+
 				$banlist[] = array(
 					'timestamp' => (double) $match[1],
 					'gmdate' => gmdate('c', $match[1]),
 					'ref' => (int) $match[2],
-					'flags' => $match[3],
+					'flags' => (count($flags) > 0 && !empty($flags[0]) ? $flags : null),
 					'pointer' => (!empty($match[4]) ? $match[4] : null),
 					'spec' => trim($match[5])
 				);
@@ -84,21 +90,18 @@ class VarnishSocket {
 		$response = $this->write('ban ' . $spec);
 
 		switch ($response['code'][0]) {
-		case 200:
+		case self::CLIS_OK:
 			return true;
 
-		case 104:
-			throw new Exception('Unknown ban request');
-
 		default:
-			throw new Exception($response['message'][0]);
+			return $response['message'][0];
 		}
 	}
 
 	private function sendAuth($challenge) {
 		$response = $this->write('auth ' . $this->genAuthCode($challenge));
 
-		if ($response['code'][0] === 200 && $response['code'][1] === 248) {
+		if ($response['code'] === self::CLIS_OK) {
 			$this->auth = true;
 		} else {
 			throw new Exception('Authentication failed.');
@@ -107,49 +110,35 @@ class VarnishSocket {
 
 	private function write($data, $expectedResponseCode = null) {
 		if ($this->fp) {
-			fwrite($this->fp, $data . "\r\n");
+			fwrite($this->fp, $data . self::NL);
 			return $this->receive($expectedResponseCode);
 		}
 	}
 
 	private function receive($expectedResponseCode = null) {
 		$response = '';
-		$code = '';
-		$eof = "\n\n";
-		$breaks = 1;
-		$line = fgets($this->fp);
+		$chars_sent = 0;
+		$chars_expected = 0;
 
-		while ($line !== false) {
-			var_dump($line);
+		while (($line = fgets($this->fp)) !== false) {
 			// line starts with numeric code defining the response type and length of response
 			if (preg_match('/(\d{3})\s(\d+)/', $line, $code)) {
-				$code[1] = (int) $code[1];
-				$code[2] = (int) $code[2];
-
-				if ($code[1] === 107 ||
-					($code[1] === 200 && $code[2] === 248)) {
-					// increase required number of line break gaps for these response types
-					$breaks += 1;
-				}
-
-				if ($code[1] === 106 || $code === 104) {
-					$eof = "\n";
-					$breaks += 1;
-				}
+				// set expected characters (including +1 for terminating newline)
+				$chars_expected = (int) $code[2] + 1;
+			} else {
+				$chars_sent += strlen($line);
 			}
 
 			$response .= $line;
 
-			if (substr($response, -strlen($eof), strlen($eof)) === $eof && --$breaks === 0) {
+			if ($chars_sent >= $chars_expected) {
 				break;
 			}
-
-			$line = fgets($this->fp);
 		}
 
 		$response = $this->parseResponse($response);
 
-		if (empty($expectedResponseCode) || $response['code'][0] === $expectedResponseCode) {
+		if (empty($expectedResponseCode) || $response['code'] === $expectedResponseCode) {
 			return $response;
 		} else {
 			throw new Exception('Invalid response from server');
@@ -163,11 +152,9 @@ class VarnishSocket {
 		if (count($data) >= 2) {
 			$responseCode = trim($data[0]);
 			$responseCode = explode(' ', $responseCode);
+			$responseCode = (int) $responseCode[0];
 
-			$responseCode[0] = (int) $responseCode[0];
-			$responseCode[1] = (int) $responseCode[1];
-
-			if (count($responseCode) === 2 && is_numeric($responseCode[0])) {
+			if (is_numeric($responseCode)) {
 				for ($a = 1; $a < count($data); $a += 1) {
 					$data[$a] = trim($data[$a]);
 
@@ -187,7 +174,7 @@ class VarnishSocket {
 	}
 
 	private function genAuthCode($challenge) {
-		$string = $challenge . chr(0x0A) . $this->params['secret'] . chr(0x0A) . $challenge . "\n";
+		$string = $challenge . self::NL . $this->params['secret'] . self::NL . $challenge . "\n";
 
 		return hash(
 			'sha256',
@@ -197,7 +184,7 @@ class VarnishSocket {
 
 	private function checkAuth() {
 		if (!$this->fp || !$this->auth) {
-			throw new Exception('Authentication has not yet taken place. Have you connected with connect()?');
+			throw new Exception('Connection has not yet taken place. Have you connected with connect()?');
 		}
 	}
 }
