@@ -256,13 +256,19 @@ If a stat is not displayed even if 'Show' is set to 'All', then it is likely bec
 
 ### Fatal Error! "The "settings.php" file does not exist. Have you created it?"
 
-This one should be pretty clear already but if you're not sure, it's just a case of following step **1** of the installation to create the `settings.php` file which should be placed next to the `index.php` file wherever you've installed the Varnish PHP Admin page.
+This one should be pretty clear already but if you're not sure, it's just a case of following **step 1** of the installation to create the `settings.php` file which should be placed next to the `index.php` file wherever you've installed the Varnish PHP Admin page.
 
 ### Fatal Error! "Socket could not be opened to host."
 
-When PURGE-ing or BAN-ing, Varnish PHP Admin will attempt to connect to your server using the IP and port you defined within `settings.php`. It also sends the `Host` header which you have defined within the actions form at the top.
+When PURGE-ing or BAN-ing over HTTP, Varnish PHP Admin will attempt to connect to your server using the IP and port you defined within `settings.php`. It also sends a `Host` header depdnding on the host you have selected to view.
 
 If your `varnish_socket_ip` or `varnish_socket_port` options in the `settings.php` file are pointing to the wrong place, or the port defined is not opened by your firewall, the Varnish PHP Admin can have trouble creating a socket. Check that your server is accessible at the IP/port you have defined.
+
+### Fatal Error! "Socket error: [error message]"
+
+If this occurs when using `admin` style BANs, you may have misconfigured the `varnish_socket_ip` or `varnish_socket_port` settings, or the IP and port combination could not be accessed via the Admin interface.
+
+Check you have opened the defined port, and that the IP is accessible from within the server running the interface.
 
 ### Fatal Error! "Password not defined. Please define a password before continuing!"
 
@@ -276,7 +282,7 @@ If you see this error and are using the `admin` ban method, you may have entered
 
 The shell script `varnishstat.sh` attempts to ensure that the statistic files it creates are world-readable for you, but it likely needs to run as an elevated user in order to do so. This will also help ensure it can run the `varnishstat` and `varnishlog` commands as necessary.
 
-Ensure you have the shell script set up as per step **2** of the installation instructions.
+Ensure you have the shell script set up as per **step 3** of the installation instructions.
 
 If everything is set up, you may also want to check the `varnish_data_path` option in the `settings.php` file is also pointing to the same path as the shell script command. For instance:
 
@@ -290,7 +296,7 @@ If everything is set up, you may also want to check the `varnish_data_path` opti
 
 ### The 'hosts' field in the header doesn't exist
 
-If you are attempting to use virtual hosts then please ensure you have followed the guidance in step 3 regarding virtual hosts.
+If you are attempting to use virtual hosts then please ensure you have followed the guidance in **step 3** regarding virtual hosts.
 
 Directories must be placed within the `hosts` folder of your data path, and be readable by the user running the apache process. The shell script will take care of this but it must have run at least once.
 
