@@ -3,14 +3,28 @@
  * Varnish PHP Admin
  * @author: Neil Anderson
  * @license: MIT
+ * @version: 0.1.0
  */
 session_start();
 
 $params = getParams(array(
 	'show-stats' => 'auto',
 	'settings' => getSettings(),
+	'host' => '',
 	'reload' => ''
 ));
+
+$hosts = hosts::getHostNames(
+	$params['settings']['varnish_data_path'] . '/' . $params['settings']['apache_hosts_dir']
+);
+
+if (empty($params['host'])) {
+	if (count($hosts) > 0) {
+		$params['host'] = $hosts[0];
+	} else {
+		$params['host'] = $_SERVER['HTTP_HOST'];
+	}
+}
 
 date_default_timezone_set($params['settings']['timezone']);
 
@@ -28,7 +42,8 @@ function getSettings() {
 		$settings = array_merge(array(
 			'password' => '',
 			'varnish_data_path' => '',
-			'apache_hosts_path' => '',
+			'apache_hosts_dir' => 'hosts',
+			'varnish_stats_dir' => 'stats',
 			'varnish_http_ip' => '::1',
 			'varnish_http_port' => '80',
 			'timezone' => 'Europe/London',
@@ -36,7 +51,8 @@ function getSettings() {
 			'varnish_socket_port' => '6082',
 			'varnish_socket_secret' => '',
 			'varnish_ban_method' => 'http',
-			'date_format' => 'j F Y g:i a'
+			'date_format' => 'j F Y g:i a',
+			'page_title' => 'Varnish Status Administration'
 		), $settings);
 
 		return $settings;
@@ -70,34 +86,90 @@ function getParams($defaults) {
 }
 
 /**
+ * URL management
+ */
+class URL {
+	static function getBaseUri() {
+		return strtok($_SERVER['REQUEST_URI'], '?');
+	}
+
+	static function getQueryArgs() {
+		if (isset($_GET) && !empty($_GET)) {
+			return $_GET;
+		} else {
+			return array();
+		}
+	}
+
+	static function get() {
+		return $_SERVER['REQUEST_URI'];
+	}
+
+	static function getQueryAsInputs($type = 'hidden') {
+		$inputs = array();
+
+		foreach (self::getQueryArgs() as $key => $value) {
+			$inputs[] = '<input type="' . entities($type) . '" name="' . entities($key) . '" value="' . entities($value) . '"/>';
+		}
+
+		return implode($inputs, "\n");
+	}
+
+	static function buildQuery(array $params, $encode = true) {
+		return http_build_query($params, '', ($encode ? '&amp;' : '&'));
+	}
+
+	/**
+	 * Replace the current query string with the contents of `$params`.
+	 */
+	static function replace(array $params = array(), $encode = true) {
+		$query = self::buildQuery($params, $encode);
+
+		return self::getBaseUri() . (strlen($query) > 0 ? '?' . $query : '');
+	}
+
+	/**
+	 * Amend the current query string using the contents of `$params`.
+	 * Will not affect existing query elements unless they are defined in the
+	 * array. Will remove elements defined with values of `null`.
+	 */
+	static function amend(array $params = array(), $encode = true) {
+		$current = self::getQueryArgs();
+		$new = array_merge($current, $params);
+		$query = self::buildQuery($new, $encode);
+
+		return self::getBaseUri() . (strlen($query) > 0 ? '?' . $query : '');
+	}
+}
+
+/**
  * Static class to provide Apache host information
  */
 class hosts {
-	static function getHostNames($hosts_path) {
-		$files = self::getHostFiles($hosts_path);
-		$hosts = array();
+	static $hosts;
 
-		foreach ($files as $file) {
-			if (is_readable($file)) {
-				$contents = file_get_contents($file);
-				preg_match('/ServerName\s+(.*)/', $contents, $servername);
-				preg_match_all('/ServerAlias\s+(.*)/', $contents, $serveralias);
+	static function getHostNames($hostsPath, $fullPaths = false) {
+		if (empty(self::$hosts)) {
+			self::$hosts = array();
 
-				$servername = explode(' ', $servername[1]);
-				$hosts = array_merge($hosts, $servername);
+			if (file_exists($hostsPath) && is_readable($hostsPath)) {
+				$iterator = new DirectoryIterator(
+					$hostsPath
+				);
 
-				foreach ($serveralias[1] as $aliasline) {
-					$aliasline = explode(' ', $aliasline);
-					$hosts = array_merge($hosts, $aliasline);
+				foreach ($iterator as $file) {
+					if ($file->isDir() && !$file->isDot()) {
+						if ($fullPaths) {
+							self::$hosts[] = $file->getRealPath();
+						} else {
+							self::$hosts[] = $file->getBaseName();
+						}
+					}
 				}
 			}
 		}
 
-		return $hosts;
-	}
-
-	static function getHostFiles($hosts_path) {
-		return glob($hosts_path . '/*.conf');
+		return self::$hosts;
 	}
 }
 
@@ -409,9 +481,11 @@ class VarnishCMD {
 	private $banlist;
 
 	protected $params;
+	protected $hosts;
 
-	function __construct($params) {
+	function __construct($params, $hosts) {
 		$this->params = $params;
+		$this->hosts = $hosts;
 	}
 
 	/**
@@ -465,15 +539,15 @@ class VarnishCMD {
 	}
 
 	protected function getTop() {
-		return $this->parseTopLines($this->params['settings']['varnish_data_path'] . '/top.json');
+		return $this->parseTopLines('top.txt');
 	}
 
 	protected function getTopMisses() {
-		return $this->parseTopLines($this->params['settings']['varnish_data_path'] . '/top-misses.json');
+		return $this->parseTopLines('top-misses.txt');
 	}
 
 	protected function getTopUA() {
-		return $this->parseTopLines($this->params['settings']['varnish_data_path'] . '/top-ua.json', 'ReqHeader\sUser-Agent\:');
+		return $this->parseTopLines('top-ua.txt', 'ReqHeader\sUser-Agent\:');
 	}
 
 	protected function getBanList($force = false) {
@@ -549,7 +623,8 @@ class VarnishCMD {
 
 	private function getStatFileList() {
 		$output = array();
-		$statpath = $this->params['settings']['varnish_data_path'] . '/stat';
+		$statpath = $this->params['settings']['varnish_data_path'] . '/' .
+			$this->params['settings']['varnish_stats_dir'];
 
 		if (!file_exists($statpath) || !is_readable($statpath)) {
 			return $output;
@@ -595,6 +670,17 @@ class VarnishCMD {
 
 	private function parseTopLines($file, $ident = '\w*', $limit = 20) {
 		$data = '';
+
+		if (count($this->hosts) > 0) {
+			// use host file
+			$file = $this->params['settings']['varnish_data_path'] . '/' .
+				$this->params['settings']['apache_hosts_dir'] . '/' .
+				$this->params['host'] . '/' . $file;
+		} else {
+			// use server wide file
+			$file = $this->params['settings']['varnish_data_path'] . '/' . $file;
+		}
+
 		$top = array();
 
 		if (file_exists($file) && is_readable($file)) {
@@ -624,8 +710,8 @@ class VarnishStats extends VarnishCMD {
 	public $uri;
 	public $stats;
 
-	function __construct($params) {
-		parent::__construct($params);
+	function __construct($params, $hosts) {
+		parent::__construct($params, $hosts);
 
 		$this->stats = $this->getStats(true);
 		$this->uri = $_SERVER['REQUEST_URI'];
@@ -782,8 +868,8 @@ class VarnishStats extends VarnishCMD {
 }
 
 class VarnishTop extends VarnishCMD {
-	function __construct($params) {
-		parent::__construct($params);
+	function __construct($params, $hosts) {
+		parent::__construct($params, $hosts);
 	}
 
 	function table($type) {
@@ -824,8 +910,8 @@ class VarnishAdmin extends VarnishCMD {
 	public $varnish_response;
 	public $flashError;
 
-	function __construct($params) {
-		parent::__construct($params);
+	function __construct($params, $hosts) {
+		parent::__construct($params, $hosts);
 
 		if (empty($this->params['settings']['password'])) {
 			throw new Exception('Password not defined. Please define a password before continuing!');
@@ -845,7 +931,7 @@ class VarnishAdmin extends VarnishCMD {
 			$this->getBanList(true);
 
 			// redirect to version without reload
-			$this->redirect('', true);
+			$this->redirect(true);
 		}
 	}
 
@@ -916,7 +1002,7 @@ class VarnishAdmin extends VarnishCMD {
 		if (isset($_POST['ban'])) {
 			$this->checkSession();
 
-			$host = $_POST['host'];
+			$host = $this->params['host'];
 			$query = $_POST['query'];
 
 			$response = $this->addBan($query, isset($_POST['full_ban_query']), $host);
@@ -939,7 +1025,7 @@ class VarnishAdmin extends VarnishCMD {
 		} elseif (isset($_POST['purge'])) {
 			$this->checkSession();
 
-			$host = $_POST['host'];
+			$host = $this->params['host'];
 			$query = $_POST['query'];
 
 			$this->setVarnishResponse(
@@ -958,7 +1044,7 @@ class VarnishAdmin extends VarnishCMD {
 			}
 		}
 
-		// $this->redirect();
+		$this->redirect();
 	}
 
 	private function setVarnishResponse($value, $data) {
@@ -978,13 +1064,13 @@ class VarnishAdmin extends VarnishCMD {
 		$_SESSION[$key] = $value;
 	}
 
-	private function redirect($url = '', $trim_query = false) {
-		if (empty($url)) {
-			$url = $_SERVER['REQUEST_URI'];
-		}
-
-		if ($trim_query) {
-			$url = preg_replace('/\?.*/', '', $url);
+	private function redirect($clean = false) {
+		if ($clean) {
+			$url = URL::replace(array(
+				'host' => $this->params['host']
+			), false);
+		} else {
+			$url = URL::get();
 		}
 
 		header('Location: ' . $url);
@@ -992,7 +1078,7 @@ class VarnishAdmin extends VarnishCMD {
 	}
 }
 
-$admin = new VarnishAdmin($params);
+$admin = new VarnishAdmin($params, $hosts);
 ?>
 <!DOCTYPE html>
 <html>
@@ -1016,6 +1102,10 @@ header {
 	margin-bottom: 20px;
 	border-bottom: 1px solid #808080;
 	background-color: #fbe986;
+}
+
+#switchhosts {
+	margin-top: 20px;
 }
 
 #purgeban .form-group {
@@ -1049,7 +1139,7 @@ if (!$admin->hasSession()) {
 		<div class="container-fluid head">
 			<div class="row">
 				<header class="col col-xs-12">
-					<h1>Varnish Status Administration</h1>
+					<h1><?php echo $params['settings']['page_title']?></h1>
 				</header>
 			</div>
 
@@ -1072,33 +1162,34 @@ if (!$admin->hasSession()) {
 		</div>
 <?php
 } else {
-	$stats = new VarnishStats($params);
-	$top = new VarnishTop($params);
+	$stats = new VarnishStats($params, $hosts);
+	$top = new VarnishTop($params, $hosts);
 ?>
 		<div class="container-fluid head">
 			<div class="row">
 				<header class="col col-xs-12">
-					<h1>Varnish Status Administration</h1>
+					<h1 class="pull-left"><?php echo $params['settings']['page_title']?></h1>
+
+					<form action="" id="switchhosts" class="form-inline pull-right">
+						<div class="form-group">
+							<?php $hostnames = hosts::getHostNames($params['settings']['varnish_data_path'] . '/' . $params['settings']['apache_hosts_dir']); ?>
+							<?php if (count($hostnames) > 0): ?>
+								<select name="host" id="switchhosts-host" class="form-control" title="Select Host">
+									<?php foreach ($hostnames as $host): ?>
+										<option<?php if ($host === $params['host']): ?> selected="selected"<?php endif; ?>><?php echo $host; ?></option>
+									<?php endforeach; ?>
+								</select>
+							<?php else: ?>
+								<p class="lead"><b><?php echo entities($params['host']); ?></b></p>
+							<?php endif; ?>
+						</div>
+					</form>
 				</header>
 			</div>
 
 			<div class="row">
 				<div class="col col-xs-12">
-					<form action="" id="purgeban" method="post" class="form-inline">
-						<div class="form-group">
-							<label for="purgeban-host">Host</label>
-							<?php $hostnames = hosts::getHostNames($params['settings']['apache_hosts_path']); ?>
-							<?php if (count($hostnames) > 0): ?>
-								<select name="host" id="purgeban-host" class="form-control">
-									<?php foreach ($hostnames as $host): ?>
-										<option<?php if ($host === $_SERVER['HTTP_HOST']): ?> selected="selected"<?php endif; ?>><?php echo $host; ?></option>
-									<?php endforeach; ?>
-								</select>
-							<?php else: ?>
-								<input type="text" name="host" id="purgeban-host" class="form-control" size="30" value="<?php echo $_SERVER['HTTP_HOST']; ?>"/>
-							<?php endif; ?>
-						</div>
-
+					<form action="<?php echo URL::get(); ?>" id="purgeban" method="post" class="form-inline">
 						<div class="form-group">
 							<label for="purgeban-query">Query</label>
 							<input type="text" name="query" id="purgeban-query" class="form-control" size="40"/>
@@ -1142,7 +1233,7 @@ if (!$admin->hasSession()) {
 				<div class="col col-xs-12 col-md-6">
 					<div class="row">
 						<div class="col col-xs-12 col-md-6">
-							<h2><span class="glyphicon glyphicon-stats"></span>&nbsp;Stats</h2>
+							<h2><span class="glyphicon glyphicon-stats"></span>&nbsp;Global stats</h2>
 						</div>
 
 						<div class="col col-xs-12 col-md-6">
@@ -1152,9 +1243,9 @@ if (!$admin->hasSession()) {
 								</div>
 
 								<div class="btn-group" role="group">
-									<button type="submit" name="show-stats" value="auto" class="btn btn-default<?php echo ($params['show-stats'] == 'auto') ? ' active' : ''; ?>">Auto</button>
-									<button type="submit" name="show-stats" value="extended" class="btn btn-default<?php echo ($params['show-stats'] == 'extended') ? ' active' : ''; ?>">Extended</button>
-									<button type="submit" name="show-stats" value="all" class="btn btn-default<?php echo ($params['show-stats'] == 'all') ? ' active' : ''; ?>">All</button>
+									<a href="<?php echo URL::amend(array('show-stats' => null)); ?>" name="show-stats" value="auto" class="btn btn-default<?php echo ($params['show-stats'] == 'auto') ? ' active' : ''; ?>">Auto</a>
+									<a href="<?php echo URL::amend(array('show-stats' => 'extended')); ?>" name="show-stats" value="extended" class="btn btn-default<?php echo ($params['show-stats'] == 'extended') ? ' active' : ''; ?>">Extended</a>
+									<a href="<?php echo URL::amend(array('show-stats' => 'all')); ?>" name="show-stats" value="all" class="btn btn-default<?php echo ($params['show-stats'] == 'all') ? ' active' : ''; ?>">All</a>
 								</div>
 							</form>
 						</div>
@@ -1167,7 +1258,7 @@ if (!$admin->hasSession()) {
 					<?php if ($params['settings']['varnish_ban_method'] === 'admin' && $admin->getBanList() > 0): ?>
 						<h2>
 							<span class="glyphicon glyphicon-asterisk"></span>&nbsp;Ban list
-							<a href="?reload=1" class="btn btn-default pull-right"><span class="glyphicon glyphicon-refresh"></span>&nbsp;Reload</a>
+							<a href="<?php echo URL::amend(array('reload' => 1)); ?>" class="btn btn-default pull-right"><span class="glyphicon glyphicon-refresh"></span>&nbsp;Reload</a>
 						</h2>
 						<?php echo $admin->getBanListTable(); ?>
 					<?php endif; ?>
@@ -1212,6 +1303,10 @@ if (!$admin->hasSession()) {
 						$(this).popover('show');
 						alertedFullBan = true;
 					}
+				});
+
+				$('#switchhosts-host').on('change', function() {
+					$(this).closest('form').get(0).submit();
 				});
 
 				$(document.body).click(function() {

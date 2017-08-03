@@ -5,6 +5,5 @@
  */
 return array(
 	'password' => '',
-	'varnish_data_path' => '/var/varnish/data',
-	'apache_hosts_path' => '/path/to/apache/hosts'
+	'varnish_data_path' => '/var/varnish/data'
 );
