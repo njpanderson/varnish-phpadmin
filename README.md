@@ -100,9 +100,9 @@ The argument after the script filename defines where the data will be placed. Th
 
 ```
 /var/varnish/data/
- > top.json
- > top-misses.json
- > top-ua.json
+ > top.txt
+ > top-misses.txt
+ > top-ua.txt
  > stat/
 	 > ##.json
 ```
