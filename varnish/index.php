@@ -11,7 +11,8 @@ $params = getParams(array(
 	'show-stats' => 'auto',
 	'settings' => getSettings(),
 	'host' => '',
-	'reload' => ''
+	'reload' => '',
+	'ban_list_max' => 20
 ));
 
 $hosts = hosts::getHostNames(
@@ -226,10 +227,12 @@ class VarnishSocket {
 
 	public function getBanList() {
 		$this->checkAuth();
-		$response = $this->write('ban.list', self::CLIS_OK);
-		$banlist = array();
 
-		for ($a = 1; $a < count($response['message']); $a += 1) {
+		$response = $this->write('ban.list', self::CLIS_OK | self::CLIS_TRUNCATED);
+		$banlist = array();
+		$count = 0;
+
+		for ($a = 1; $a < count($response['message']) && $count < $this->params['ban_list_max']; $a += 1) {
 			preg_match('/([\d\.]+)\s+(\d+)\s([CRO-]+) +(0x[^ ]+)?(.+)?/', $response['message'][$a], $match);
 
 			if (count($match) === 6) {
@@ -243,7 +246,14 @@ class VarnishSocket {
 					'pointer' => (!empty($match[4]) ? $match[4] : null),
 					'spec' => trim($match[5])
 				);
+				$count += 1;
 			}
+		}
+
+		if (count($response['message']) > $this->params['ban_list_max']) {
+			$banlist[] = array(
+				'spec' => '(List truncated - ' . number_format(count($response['message']), 0) . ' total bans)'
+			);
 		}
 
 		return $banlist;
@@ -301,7 +311,10 @@ class VarnishSocket {
 
 		$response = $this->parseResponse($response);
 
-		if (empty($expectedResponseCode) || $response['code'] === $expectedResponseCode) {
+		if (
+			empty($expectedResponseCode) ||
+			($expectedResponseCode & $response['code'])
+		) {
 			return $response;
 		} else {
 			throw new Exception('Invalid response from server');
@@ -986,7 +999,7 @@ class VarnishAdmin extends VarnishCMD {
 
 			foreach ($list as $ban) {
 				$table .= table::row(array(
-					date($this->params['settings']['date_format'], $ban['timestamp']),
+					(isset($ban['timestamp']) ? date($this->params['settings']['date_format'], $ban['timestamp']) : ''),
 					$ban['ref'],
 					$ban['spec']
 				));
